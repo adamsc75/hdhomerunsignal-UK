@@ -46,7 +46,7 @@ The original Android app functionality has been recreated with:
 1. **Device Selection**: Choose your HDHomeRun device from the dropdown
 2. **Channel Map**: Select the appropriate channel map (US Broadcast is default)
 3. **Tuner Selection**: Use the arrow buttons to switch between tuners
-4. **Channel Scanning**: Click "Scan" to find available channels
+4. **Channel Selection**: Enter the channel you want to tune to and press the tuner icon or hit enter
 5. **Monitor Signal**: View real-time signal strength, SNR, and symbol quality
 
 ## Configuration
