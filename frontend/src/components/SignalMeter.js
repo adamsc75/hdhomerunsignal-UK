@@ -2,7 +2,7 @@
 /* eslint-disable no-console */
 /* const path = require('path'); */
 const express = require('express');
-const cors = require('cors');
+/* const cors = require('cors'); */
 const http = require('http');
 const { Server } = require('socket.io');
 const { execFile } = require('child_process');
