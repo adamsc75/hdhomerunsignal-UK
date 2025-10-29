@@ -56,7 +56,8 @@ const CHANNEL_MAPS = [
   { value: 'us-bcast', label: 'US Broadcast' },
   { value: 'us-cable', label: 'US Cable' },
   { value: 'us-hrc', label: 'US HRC' },
-  { value: 'us-irc', label: 'US IRC' }
+  { value: 'us-irc', label: 'US IRC' },
+  { value: "eu-bcast", label: "EU Broadcast (UK)" } // ➕ new option
 ];
 
 function SignalMeter() {
