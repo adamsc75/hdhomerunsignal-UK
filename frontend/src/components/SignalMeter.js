@@ -1,6 +1,6 @@
 // backend/server.js
 /* eslint-disable no-console */
-const path = require('path');
+/* const path = require('path'); */
 const express = require('express');
 const cors = require('cors');
 const http = require('http');
