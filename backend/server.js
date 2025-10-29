@@ -1,229 +1,471 @@
-// backend/server.js
-/* eslint-disable no-console */
 const express = require('express');
-const cors = require('cors');
-const http = require('http');
+const { createServer } = require('http');
 const { Server } = require('socket.io');
-const { execFile } = require('child_process');
-const bodyParser = require('body-parser');
+const { exec } = require('child_process');
+const path = require('path');
+const cors = require('cors');
 
 const app = express();
-const server = http.createServer(app);
-const io = new Server(server, { cors: { origin: '*' } });
+const server = createServer(app);
+const io = new Server(server, {
+  cors: {
+    origin: "*",
+    methods: ["GET", "POST"]
+  }
+});
 
 app.use(cors());
-app.use(bodyParser.json());
+app.use(express.json());
+app.use(express.static(path.join(__dirname, 'public')));
 
-// ------------------------
-// Helpers
-// ------------------------
-function execHdhr(args, { timeout = 8000 } = {}) {
-  return new Promise((resolve, reject) => {
-    execFile('hdhomerun_config', args, { timeout }, (err, stdout, stderr) => {
-      if (err) {
-        err.stdout = stdout?.toString() || '';
-        err.stderr = stderr?.toString() || '';
-        return reject(err);
-      }
-      resolve(stdout.toString());
-    });
-  });
-}
-
-function parseDiscover(output) {
-  const devices = [];
-  output.split('\n').forEach((line) => {
-    const m = line.match(/hdhomerun device ([0-9A-Fa-f]+) found at ([0-9.]+)/);
-    if (m) devices.push({ id: m[1], ip: m[2] });
-  });
-  return devices;
-}
-
-async function countTuners(deviceId) {
-  let count = 0;
-  for (let i = 0; i < 8; i += 1) {
-    try {
-      await execHdhr([deviceId, 'get', `/tuner${i}/status`]);
-      count += 1;
-    } catch {
-      break;
-    }
+class HDHomeRunController {
+  constructor() {
+    this.devices = [];
+    this.activeDevice = null;
+    this.activeTuner = 0;
+    this.monitoringInterval = null;
   }
-  return count || 2;
-}
 
-function parseStatus(output) {
-  const obj = {};
-  const parts = output.trim().split(/\s+/);
-  parts.forEach((kv) => {
-    const [k, v] = kv.split('=');
-    obj[k] = v;
-  });
-  ['ss', 'snq', 'seq', 'bps', 'pps'].forEach((k) => {
-    if (obj[k] != null) obj[k] = Number(String(obj[k]).replace(/[^0-9.-]/g, '')) || 0;
-  });
-  obj.channel = obj.channel || 'none';
-  obj.lock = obj.lock || '';
-  return obj;
-}
+  async discoverDevices() {
+    return new Promise((resolve, reject) => {
+      exec('hdhomerun_config discover', (error, stdout, stderr) => {
+        if (error) {
+          console.error('Discovery error:', error);
+          resolve([]);
+          return;
+        }
 
-function parseStreamInfo(output) {
-  const programs = [];
-  output.split('\n').forEach((line) => {
-    const m = line.match(/program\s+(\d+).*?virtual\s+([0-9.]+)?\s*\(?([A-Za-z0-9 _.-]+)?\)?/i);
-    if (m) {
-      const encrypted = /encrypted\s*=\s*1/i.test(line);
-      const status = (/status\s*=\s*([A-Za-z0-9_-]+)/i.exec(line) || [])[1];
-      programs.push({
-        programNum: Number(m[1]),
-        virtualChannel: m[2] || '',
-        callsign: (m[3] || '').trim(),
-        encrypted,
-        status: status || ''
+        const devices = [];
+        const lines = stdout.split('\n').filter(line => line.trim());
+        
+        lines.forEach(line => {
+          const match = line.match(/hdhomerun device ([A-F0-9-]+) found at ([0-9.]+)/);
+          if (match) {
+            devices.push({
+              id: match[1],
+              ip: match[2],
+              name: `HDHomeRun ${match[1]}`
+            });
+          }
+        });
+
+        this.devices = devices;
+        resolve(devices);
       });
-    }
-  });
-  return programs;
-}
-
-// ------------------------
-// REST API
-// ------------------------
-
-// Discover devices
-app.get('/api/devices', async (req, res) => {
-  try {
-    const out = await execHdhr(['discover']);
-    res.json(parseDiscover(out));
-  } catch (e) {
-    console.error('discover error:', e.stderr || e.message);
-    res.status(500).json({ error: 'Failed to discover devices', detail: e.stderr || e.message });
+    });
   }
-});
 
-// Device info (model + tuner count)
-app.get('/api/devices/:id/info', async (req, res) => {
-  const { id } = req.params;
-  try {
-    const modelOut = await execHdhr([id, 'get', '/sys/model']).catch(() => '');
-    const model = String(modelOut || '').trim().replace(/^model\s*=\s*/i, '') || 'Unknown';
-    const tuners = await countTuners(id);
-    res.json({ id, model, tuners });
-  } catch (e) {
-    console.error('info error:', e.stderr || e.message);
-    res.status(500).json({ error: 'Failed to get device info', detail: e.stderr || e.message });
+  async getDeviceInfo(deviceId) {
+    return new Promise((resolve, reject) => {
+      // Get both model and tuner count
+      exec(`hdhomerun_config ${deviceId} get /sys/model`, (error, stdout) => {
+        if (error) {
+          resolve({ model: 'Unknown', tuners: 2 });
+          return;
+        }
+        
+        const model = stdout.trim();
+        
+        // Try to get actual tuner count by checking which tuners exist
+        this.getTunerCount(deviceId).then(tunerCount => {
+          resolve({ model, tuners: tunerCount });
+        }).catch(() => {
+          // Fallback to model-based detection
+          let tuners = 2;
+          if (model.includes('PRIME')) tuners = 3;
+          else if (model.includes('QUATTRO') || model.includes('QUATRO')) tuners = 4;
+          else if (model.includes('DUO')) tuners = 2;
+          else if (model.includes('FLEX')) tuners = 2;
+          else if (model.includes('CONNECT')) tuners = 2;
+          
+          resolve({ model, tuners });
+        });
+      });
+    });
   }
-});
 
-// ✅ Set channel map (supports 'eu-bcast', 'us-bcast', etc.)
-app.post('/api/devices/:id/tuner/:tuner/channelmap', async (req, res) => {
-  const { id, tuner } = req.params;
-  const { map } = req.body;
-  if (!map) return res.status(400).json({ error: 'map is required' });
-  try {
-    await execHdhr([id, 'set', `/tuner${tuner}/channelmap`, map]);
-    res.json({ ok: true });
-  } catch (e) {
-    console.error('set channelmap error:', e.stderr || e.message);
-    res.status(500).json({ error: 'Failed to set channel map', detail: e.stderr || e.message });
+  async getTunerCount(deviceId) {
+    return new Promise((resolve, reject) => {
+      // Check tuners 0-7 to see which ones exist
+      const checkTuner = (tunerNum) => {
+        return new Promise((resolveCheck) => {
+          exec(`hdhomerun_config ${deviceId} get /tuner${tunerNum}/status`, (error, stdout) => {
+            // If no error, tuner exists (even if status is 'none')
+            resolveCheck(!error);
+          });
+        });
+      };
+
+      Promise.all([
+        checkTuner(0), checkTuner(1), checkTuner(2), checkTuner(3),
+        checkTuner(4), checkTuner(5), checkTuner(6), checkTuner(7)
+      ]).then(results => {
+        const tunerCount = results.filter(exists => exists).length;
+        resolve(tunerCount > 0 ? tunerCount : 2); // Default to 2 if none found
+      }).catch(() => {
+        resolve(2); // Default fallback
+      });
+    });
   }
-});
 
-// ✅ Tune channel (supports "21", "auto:650000000", "auto:650000000:101", "21:101")
-app.post('/api/devices/:id/tuner/:tuner/channel', async (req, res) => {
-  const { id, tuner } = req.params;
-  let { channel } = req.body;
-  if (!channel) return res.status(400).json({ error: 'channel is required' });
+  async scanChannels(deviceId, tuner = 0, channelMap = 'us-bcast') {
+    return new Promise((resolve, reject) => {
+      const command = `hdhomerun_config ${deviceId} scan /tuner${tuner} ${channelMap}`;
+      
+      exec(command, { timeout: 60000 }, (error, stdout, stderr) => {
+        if (error) {
+          console.error('Scan error:', error);
+          resolve([]);
+          return;
+        }
 
-  try {
-    let program = null;
-    if (channel.includes(':')) {
-      const parts = channel.split(':');
-      if (parts.length >= 3) {
-        program = parts[2];
-        channel = `${parts[0]}:${parts[1]}`;
-      } else if (parts.length === 2 && /^\d+$/.test(parts[1])) {
-        program = parts[1];
-        channel = parts[0];
-      }
-    }
+        const channels = [];
+        const lines = stdout.split('\n');
+        
+        lines.forEach(line => {
+          const scanMatch = line.match(/SCANNING: (\d+) \(([^)]+)\)/);
+          const lockMatch = line.match(/LOCK: (\w+) \(ss=(\d+) snq=(\d+) seq=(\d+)\)/);
+          const programMatch = line.match(/PROGRAM (\d+): ([\d.]+) (.+)/);
+          
+          if (scanMatch && lockMatch) {
+            const frequency = scanMatch[1];
+            const channel = scanMatch[2];
+            const modulation = lockMatch[1];
+            const signalStrength = parseInt(lockMatch[2]);
+            const snr = parseInt(lockMatch[3]);
+            const symbolQuality = parseInt(lockMatch[4]);
+            
+            channels.push({
+              frequency,
+              channel,
+              modulation,
+              signalStrength,
+              snr,
+              symbolQuality,
+              programs: []
+            });
+          }
+          
+          if (programMatch && channels.length > 0) {
+            const programNum = programMatch[1];
+            const virtualChannel = programMatch[2];
+            const name = programMatch[3];
+            
+            channels[channels.length - 1].programs.push({
+              programNum,
+              virtualChannel,
+              name
+            });
+          }
+        });
 
-    await execHdhr([id, 'set', `/tuner${tuner}/channel`, channel]);
-    if (program) {
-      await execHdhr([id, 'set', `/tuner${tuner}/program`, String(program)]);
-    }
-
-    res.json({ ok: true, channel, program: program ? Number(program) : null });
-  } catch (e) {
-    console.error('set channel error:', e.stderr || e.message);
-    res.status(500).json({ error: 'Failed to set channel', detail: e.stderr || e.message });
+        resolve(channels);
+      });
+    });
   }
-});
 
-// Clear tuner
-app.post('/api/devices/:id/tuner/:tuner/clear', async (req, res) => {
-  const { id, tuner } = req.params;
-  try {
-    await execHdhr([id, 'set', `/tuner${tuner}/channel`, 'none']);
-    await execHdhr([id, 'set', `/tuner${tuner}/program`, 'none']).catch(() => {});
-    res.json({ ok: true });
-  } catch (e) {
-    console.error('clear tuner error:', e.stderr || e.message);
-    res.status(500).json({ error: 'Failed to clear tuner', detail: e.stderr || e.message });
+  async getTunerStatus(deviceId, tuner = 0) {
+    return new Promise((resolve, reject) => {
+      exec(`hdhomerun_config ${deviceId} get /tuner${tuner}/status`, (error, stdout) => {
+        if (error) {
+          resolve(null);
+          return;
+        }
+
+        const status = {};
+        const statusLine = stdout.trim();
+        
+        if (statusLine === 'none') {
+          resolve({ channel: 'none', lock: false });
+          return;
+        }
+
+        const patterns = {
+          channel: /ch=([^\s]+)/,
+          lock: /lock=([^\s]+)/,
+          ss: /ss=(\d+)/,
+          snq: /snq=(\d+)/,
+          seq: /seq=(\d+)/,
+          bps: /bps=(\d+)/,
+          pps: /pps=(\d+)/
+        };
+
+        Object.entries(patterns).forEach(([key, pattern]) => {
+          const match = statusLine.match(pattern);
+          if (match) {
+            status[key] = key === 'lock' ? match[1] : 
+                         ['ss', 'snq', 'seq', 'bps', 'pps'].includes(key) ? 
+                         parseInt(match[1]) : match[1];
+          }
+        });
+
+        status.lock = status.lock !== undefined;
+        resolve(status);
+      });
+    });
   }
-});
 
-// Current channel programs
-app.get('/api/devices/:id/tuner/:tuner/programs', async (req, res) => {
-  const { id, tuner } = req.params;
-  try {
-    const out = await execHdhr([id, 'get', `/tuner${tuner}/streaminfo`]);
-    res.json(parseStreamInfo(out));
-  } catch (e) {
-    console.warn('streaminfo failed:', e.stderr || e.message);
-    res.json([]);
+  async getCurrentProgram(deviceId, tuner = 0) {
+    return new Promise((resolve, reject) => {
+      exec(`hdhomerun_config ${deviceId} get /tuner${tuner}/program`, (error, stdout) => {
+        if (error) {
+          resolve(null);
+          return;
+        }
+
+        const program = stdout.trim();
+        if (program && program !== 'none') {
+          resolve(program);
+        } else {
+          resolve(null);
+        }
+      });
+    });
   }
-});
 
-// ------------------------
-// Socket.IO – live tuner status
-// ------------------------
-const monitorState = new Map();
+  async getCurrentChannelPrograms(deviceId, tuner = 0) {
+    return new Promise((resolve, reject) => {
+      exec(`hdhomerun_config ${deviceId} get /tuner${tuner}/streaminfo`, (error, stdout) => {
+        if (error) {
+          resolve([]);
+          return;
+        }
 
-io.on('connection', (socket) => {
-  socket.on('start-monitoring', ({ deviceId, tuner }) => {
-    const prev = monitorState.get(socket.id);
-    if (prev) clearInterval(prev);
+        const programs = [];
+        const lines = stdout.split('\n').filter(line => line.trim());
+        
+        lines.forEach(line => {
+          // Parse streaminfo output for program information
+          // Format: tsid=0x0001 program=1: 12.1 WHYY (encrypted)
+          const programMatch = line.match(/program=(\d+):\s*([\d.]+)\s+(.+?)(?:\s+\(([^)]+)\))?$/);
+          if (programMatch) {
+            const programNum = programMatch[1];
+            const virtualChannel = programMatch[2];
+            const name = programMatch[3].trim();
+            const status = programMatch[4] || '';
+            
+            programs.push({
+              programNum,
+              virtualChannel,
+              name,
+              callsign: name,
+              status,
+              encrypted: status.includes('encrypted')
+            });
+          } else {
+            // Try alternative format parsing for different output formats
+            const altMatch = line.match(/(\d+):\s*([\d.]+)\s+(.+)/);
+            if (altMatch) {
+              programs.push({
+                programNum: altMatch[1],
+                virtualChannel: altMatch[2],
+                name: altMatch[3].trim(),
+                callsign: altMatch[3].trim(),
+                status: '',
+                encrypted: false
+              });
+            }
+          }
+        });
 
-    const handle = setInterval(async () => {
+        resolve(programs);
+      });
+    });
+  }
+
+  async setChannel(deviceId, tuner, channel) {
+    return new Promise((resolve, reject) => {
+      exec(`hdhomerun_config ${deviceId} set /tuner${tuner}/channel ${channel}`, (error, stdout) => {
+        if (error) {
+          reject(error);
+          return;
+        }
+        resolve(stdout.trim());
+      });
+    });
+  }
+
+  async incrementChannel(deviceId, tuner) {
+    return new Promise((resolve, reject) => {
+      exec(`hdhomerun_config ${deviceId} set /tuner${tuner}/channel +`, (error, stdout) => {
+        if (error) {
+          reject(error);
+          return;
+        }
+        resolve(stdout.trim());
+      });
+    });
+  }
+
+  async decrementChannel(deviceId, tuner) {
+    return new Promise((resolve, reject) => {
+      exec(`hdhomerun_config ${deviceId} set /tuner${tuner}/channel -`, (error, stdout) => {
+        if (error) {
+          reject(error);
+          return;
+        }
+        resolve(stdout.trim());
+      });
+    });
+  }
+
+  async clearTuner(deviceId, tuner) {
+    return new Promise((resolve, reject) => {
+      exec(`hdhomerun_config ${deviceId} set /tuner${tuner}/channel none`, (error, stdout) => {
+        if (error) {
+          reject(error);
+          return;
+        }
+        resolve(stdout.trim());
+      });
+    });
+  }
+
+  startMonitoring(socket, deviceId, tuner) {
+    this.stopMonitoring();
+    
+    this.monitoringInterval = setInterval(async () => {
       try {
-        const out = await execHdhr([deviceId, 'get', `/tuner${tuner}/status`], { timeout: 4000 });
-        socket.emit('tuner-status', parseStatus(out));
-      } catch {
-        socket.emit('tuner-status', { channel: 'none', lock: '', ss: 0, snq: 0, seq: 0, bps: 0, pps: 0 });
+        const status = await this.getTunerStatus(deviceId, tuner);
+        const currentProgram = await this.getCurrentProgram(deviceId, tuner);
+        
+        socket.emit('tuner-status', {
+          ...status,
+          currentProgram
+        });
+      } catch (error) {
+        console.error('Monitoring error:', error);
       }
     }, 1000);
+  }
 
-    monitorState.set(socket.id, handle);
+  stopMonitoring() {
+    if (this.monitoringInterval) {
+      clearInterval(this.monitoringInterval);
+      this.monitoringInterval = null;
+    }
+  }
+}
+
+const hdhrController = new HDHomeRunController();
+
+// API Routes
+app.get('/api/devices', async (req, res) => {
+  try {
+    const devices = await hdhrController.discoverDevices();
+    res.json(devices);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get('/api/devices/:id/info', async (req, res) => {
+  try {
+    const info = await hdhrController.getDeviceInfo(req.params.id);
+    res.json(info);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get('/api/devices/:id/scan/:tuner', async (req, res) => {
+  try {
+    const { id, tuner } = req.params;
+    const { channelMap = 'us-bcast' } = req.query;
+    const channels = await hdhrController.scanChannels(id, tuner, channelMap);
+    res.json(channels);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get('/api/devices/:id/tuner/:tuner/status', async (req, res) => {
+  try {
+    const { id, tuner } = req.params;
+    const status = await hdhrController.getTunerStatus(id, tuner);
+    res.json(status);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get('/api/devices/:id/tuner/:tuner/programs', async (req, res) => {
+  try {
+    const { id, tuner } = req.params;
+    const programs = await hdhrController.getCurrentChannelPrograms(id, tuner);
+    res.json(programs);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/api/devices/:id/tuner/:tuner/channel', async (req, res) => {
+  try {
+    const { id, tuner } = req.params;
+    const { channel } = req.body;
+    const result = await hdhrController.setChannel(id, tuner, channel);
+    res.json({ success: true, result });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/api/devices/:id/tuner/:tuner/channel/up', async (req, res) => {
+  try {
+    const { id, tuner } = req.params;
+    const result = await hdhrController.incrementChannel(id, tuner);
+    res.json({ success: true, result });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/api/devices/:id/tuner/:tuner/channel/down', async (req, res) => {
+  try {
+    const { id, tuner } = req.params;
+    const result = await hdhrController.decrementChannel(id, tuner);
+    res.json({ success: true, result });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/api/devices/:id/tuner/:tuner/clear', async (req, res) => {
+  try {
+    const { id, tuner } = req.params;
+    const result = await hdhrController.clearTuner(id, tuner);
+    res.json({ success: true, result });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Socket.IO for real-time updates
+io.on('connection', (socket) => {
+  console.log('Client connected:', socket.id);
+
+  socket.on('start-monitoring', ({ deviceId, tuner }) => {
+    console.log(`Starting monitoring for device ${deviceId}, tuner ${tuner}`);
+    hdhrController.startMonitoring(socket, deviceId, tuner);
   });
 
   socket.on('stop-monitoring', () => {
-    const handle = monitorState.get(socket.id);
-    if (handle) clearInterval(handle);
-    monitorState.delete(socket.id);
+    console.log('Stopping monitoring');
+    hdhrController.stopMonitoring();
   });
 
   socket.on('disconnect', () => {
-    const handle = monitorState.get(socket.id);
-    if (handle) clearInterval(handle);
-    monitorState.delete(socket.id);
+    console.log('Client disconnected:', socket.id);
+    hdhrController.stopMonitoring();
   });
 });
 
-// ------------------------
-// Start server
-// ------------------------
-const PORT = process.env.PORT || 5000;
-server.listen(PORT, () => {
-  console.log(`HDHomeRun Signal backend listening on port ${PORT}`);
+// Serve React app for all other routes
+app.get('*', (req, res) => {
+  res.sendFile(path.join(__dirname, 'public', 'index.html'));
+});
+
+const PORT = process.env.PORT || 3000;
+server.listen(PORT, '0.0.0.0', () => {
+  console.log(`HDHomeRun Signal server running on port ${PORT}`);
 });
